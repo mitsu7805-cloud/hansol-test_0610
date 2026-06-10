@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
+from openai import OpenAI
 
 # 국내 주요 주식 10개 (티커: 종목명)
 STOCKS = {
@@ -25,11 +26,19 @@ st.set_page_config(
     layout="wide",
 )
 
+# 세션 상태 초기화
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
 st.title("📈 국내 주요 주식 대시보드")
 st.caption("yfinance 기반 · KOSPI 주요 10종목")
 
 # 사이드바 설정
 st.sidebar.header("⚙️ 설정")
+
+# API Key 입력
+st.sidebar.subheader("🤖 AI 챗봇 설정")
+api_key = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="sk-...")
 period_options = {"1개월": "1mo", "3개월": "3mo", "6개월": "6mo", "1년": "1y", "2년": "2y"}
 selected_period_label = st.sidebar.selectbox("조회 기간", list(period_options.keys()), index=2)
 period = period_options[selected_period_label]
@@ -175,3 +184,83 @@ with st.expander("📋 원본 종가 데이터 보기"):
     st.dataframe(display.style.format("{:,.0f}"), use_container_width=True)
 
 st.caption(f"데이터 출처: Yahoo Finance · 마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+st.divider()
+
+# ── AI 챗봇 ──────────────────────────────────────────────────────────────────
+st.subheader("🤖 AI 주식 분석 챗봇")
+
+if not api_key:
+    st.info("사이드바에 OpenAI API Key를 입력하면 챗봇을 사용할 수 있습니다.")
+else:
+    # 주식 데이터 요약 생성 (시스템 프롬프트용 컨텍스트)
+    def build_stock_context():
+        lines = [f"오늘 날짜: {datetime.now().strftime('%Y-%m-%d')}",
+                 f"조회 기간: {selected_period_label}", ""]
+        lines.append("=== 현재가 및 기간 수익률 ===")
+        for ticker in selected_tickers:
+            name = STOCKS[ticker]
+            series = close[ticker].dropna()
+            if series.empty:
+                continue
+            cur = series.iloc[-1]
+            prev = series.iloc[-2] if len(series) > 1 else cur
+            day_chg = (cur - prev) / prev * 100
+            total_chg = (series.iloc[-1] - series.iloc[0]) / series.iloc[0] * 100
+            lines.append(f"- {name}({ticker}): 현재가 {cur:,.0f}원 | 전일대비 {day_chg:+.2f}% | 기간수익률 {total_chg:+.2f}%")
+
+        lines.append("")
+        lines.append("=== 기간 수익률 순위 ===")
+        sorted_returns = returns.sort_values(ascending=False)
+        for i, (name, val) in enumerate(sorted_returns.items(), 1):
+            lines.append(f"{i}위. {name}: {val:+.2f}%")
+
+        return "\n".join(lines)
+
+    SYSTEM_PROMPT = f"""당신은 주식 분석 전문가 AI입니다.
+아래 실시간 수집된 국내 주요 주식 데이터를 바탕으로 사용자 질문에 답하세요.
+데이터 범위를 벗어나는 질문은 데이터 한계를 솔직히 밝히고 일반적인 투자 관점에서 답하세요.
+답변은 핵심 위주로 간결하게 작성하되, 수치를 근거로 활용하세요.
+
+{build_stock_context()}
+"""
+
+    def ask_gpt(user_message: str) -> str:
+        client = OpenAI(api_key=api_key)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for msg in st.session_state.chat_history:
+            messages.append(msg)
+        messages.append({"role": "user", "content": user_message})
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content
+
+    # 대화 기록 출력
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 입력창
+    if prompt := st.chat_input("주식에 대해 질문하세요. 예) 가장 수익률 높은 종목은?"):
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("분석 중..."):
+                try:
+                    answer = ask_gpt(prompt)
+                    st.markdown(answer)
+                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    err = f"오류 발생: {e}"
+                    st.error(err)
+
+    if st.session_state.chat_history:
+        if st.button("대화 초기화"):
+            st.session_state.chat_history = []
+            st.rerun()
